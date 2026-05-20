@@ -21,6 +21,7 @@
     "lint": "prettier --check . && lunte",
     "test": "npm run test:bare && npm run test:node",
     "test:bare": "brittle-bare --coverage test.js",
+    "test:ios-simulator": "node scripts/test-ios-simulator.js",
     "test:node": "brittle-node --coverage test.js"
   },
   "repository": {
