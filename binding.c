@@ -1,9 +1,13 @@
 #include <assert.h>
 #include <bare.h>
 #include <js.h>
+#include <limits.h>
+#include <math.h>
 #include <sqlite3.h>
+#include <stdarg.h>
 #include <stdbool.h>
 #include <stdint.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <utf.h>
@@ -135,6 +139,65 @@ typedef struct {
   uv_sem_t done;
 } sqlite3_native_exec_t;
 
+typedef enum {
+  SQLITE3_NATIVE_QUERY_RUN,
+  SQLITE3_NATIVE_QUERY_ALL,
+  SQLITE3_NATIVE_QUERY_VALUES,
+  SQLITE3_NATIVE_QUERY_GET,
+} sqlite3_native_query_mode_t;
+
+typedef enum {
+  SQLITE3_NATIVE_VALUE_NULL,
+  SQLITE3_NATIVE_VALUE_INTEGER,
+  SQLITE3_NATIVE_VALUE_REAL,
+  SQLITE3_NATIVE_VALUE_TEXT,
+  SQLITE3_NATIVE_VALUE_BLOB,
+} sqlite3_native_value_type_t;
+
+typedef struct {
+  sqlite3_native_value_type_t type;
+  int64_t integer;
+  double real;
+  void *bytes;
+  int len;
+} sqlite3_native_query_param_t;
+
+typedef struct {
+  sqlite3_native_value_type_t type;
+  int64_t integer;
+  double real;
+  void *bytes;
+  int len;
+} sqlite3_native_query_value_t;
+
+typedef struct {
+  sqlite3_native_query_value_t *values;
+} sqlite3_native_query_row_t;
+
+typedef struct {
+  uv_work_t handle;
+
+  sqlite3_native_t *db;
+
+  js_deferred_t *deferred;
+
+  utf8_t *query;
+  sqlite3_native_query_param_t *params;
+  int params_len;
+  sqlite3_native_query_mode_t mode;
+
+  int column_count;
+  char **column_names;
+  int row_count;
+  int row_capacity;
+  sqlite3_native_query_row_t *rows;
+
+  int64_t changes;
+  int64_t last_insert_rowid;
+
+  char *error;
+} sqlite3_native_query_t;
+
 typedef struct {
   uv_work_t handle;
 
@@ -149,6 +212,8 @@ typedef struct {
 } sqlite3_native_load_extension_t;
 
 static const size_t sqlite3_native__queue_limit = 64;
+static const double sqlite3_native__max_safe_integer = 9007199254740991.0;
+static const double sqlite3_native__min_safe_integer = -9007199254740991.0;
 
 static bool
 sqlite3_native__ends_with(const char *string, const char *suffix) {
@@ -854,6 +919,8 @@ sqlite3_native_vfs_destroy(js_env_t *env, js_callback_info_t *info) {
   err = js_get_arraybuffer_info(env, argv[0], (void **) &vfs, NULL);
   assert(err == 0);
 
+  uv_sem_destroy(&vfs->done);
+
   err = sqlite3_vfs_unregister(&vfs->handle);
   assert(err == 0);
 
@@ -874,8 +941,6 @@ sqlite3_native_vfs_destroy(js_env_t *env, js_callback_info_t *info) {
 
   err = js_delete_reference(env, vfs->ctx);
   assert(err == 0);
-
-  uv_sem_destroy(&vfs->done);
 
   return NULL;
 }
@@ -1261,6 +1326,813 @@ sqlite3_native_exec(js_env_t *env, js_callback_info_t *info) {
   return promise;
 }
 
+static char *
+sqlite3_native__copy_string(const char *string, size_t len) {
+  char *copy = malloc(len + 1);
+  if (copy == NULL) return NULL;
+
+  if (len > 0) memcpy(copy, string, len);
+  copy[len] = '\0';
+
+  return copy;
+}
+
+static char *
+sqlite3_native__format_string(const char *format, ...) {
+  va_list args;
+  va_start(args, format);
+
+  va_list copy;
+  va_copy(copy, args);
+
+  int len = vsnprintf(NULL, 0, format, copy);
+
+  va_end(copy);
+
+  if (len < 0) {
+    va_end(args);
+    return NULL;
+  }
+
+  char *string = malloc((size_t) len + 1);
+  if (string == NULL) {
+    va_end(args);
+    return NULL;
+  }
+
+  vsnprintf(string, (size_t) len + 1, format, args);
+
+  va_end(args);
+
+  return string;
+}
+
+static js_value_t *
+sqlite3_native__rejected_error(js_env_t *env, const char *message) {
+  int err;
+
+  js_deferred_t *deferred;
+  js_value_t *promise;
+  err = js_create_promise(env, &deferred, &promise);
+  assert(err == 0);
+
+  js_value_t *js_message;
+  err = js_create_string_utf8(env, (const utf8_t *) message, -1, &js_message);
+  assert(err == 0);
+
+  js_value_t *error;
+  err = js_create_error(env, NULL, js_message, &error);
+  assert(err == 0);
+
+  err = js_reject_deferred(env, deferred, error);
+  assert(err == 0);
+
+  return promise;
+}
+
+static void *
+sqlite3_native__copy_bytes(const void *bytes, int len) {
+  if (len == 0) return NULL;
+
+  void *copy = malloc(len);
+  if (copy == NULL) return NULL;
+
+  memcpy(copy, bytes, len);
+
+  return copy;
+}
+
+static void
+sqlite3_native__set_query_error(sqlite3_native_query_t *req, const char *message) {
+  if (req->error != NULL) return;
+
+  req->error = sqlite3_native__copy_string(message, strlen(message));
+}
+
+static void
+sqlite3_native__set_query_errorf(sqlite3_native_query_t *req, const char *format, ...) {
+  if (req->error != NULL) return;
+
+  va_list args;
+  va_start(args, format);
+
+  va_list copy;
+  va_copy(copy, args);
+
+  int len = vsnprintf(NULL, 0, format, copy);
+
+  va_end(copy);
+
+  if (len < 0) {
+    va_end(args);
+    sqlite3_native__set_query_error(req, "SQLite query failed");
+    return;
+  }
+
+  req->error = malloc((size_t) len + 1);
+  if (req->error == NULL) {
+    va_end(args);
+    return;
+  }
+
+  vsnprintf(req->error, (size_t) len + 1, format, args);
+
+  va_end(args);
+}
+
+static void
+sqlite3_native__set_query_sqlite_error(sqlite3_native_query_t *req) {
+  const char *message = sqlite3_errmsg(req->db->handle);
+  sqlite3_native__set_query_error(req, message == NULL ? "SQLite query failed" : message);
+}
+
+static void
+sqlite3_native__free_query_value(sqlite3_native_query_value_t *value) {
+  if (value->type == SQLITE3_NATIVE_VALUE_TEXT || value->type == SQLITE3_NATIVE_VALUE_BLOB) {
+    free(value->bytes);
+  }
+}
+
+static void
+sqlite3_native__free_query_param(sqlite3_native_query_param_t *param) {
+  if (param->type == SQLITE3_NATIVE_VALUE_TEXT || param->type == SQLITE3_NATIVE_VALUE_BLOB) {
+    free(param->bytes);
+  }
+}
+
+static void
+sqlite3_native__free_query(sqlite3_native_query_t *req) {
+  if (req == NULL) return;
+
+  free(req->query);
+
+  for (int i = 0; i < req->params_len; i++) {
+    sqlite3_native__free_query_param(&req->params[i]);
+  }
+  free(req->params);
+
+  for (int i = 0; i < req->column_count; i++) {
+    free(req->column_names[i]);
+  }
+  free(req->column_names);
+
+  for (int i = 0; i < req->row_count; i++) {
+    sqlite3_native_query_row_t *row = &req->rows[i];
+    for (int j = 0; j < req->column_count; j++) {
+      sqlite3_native__free_query_value(&row->values[j]);
+    }
+    free(row->values);
+  }
+  free(req->rows);
+
+  free(req->error);
+  free(req);
+}
+
+static int
+sqlite3_native__copy_js_param(js_env_t *env, js_value_t *value, sqlite3_native_query_param_t *param, uint32_t index, char **error) {
+  int err;
+
+  memset(param, 0, sizeof(sqlite3_native_query_param_t));
+
+  js_value_type_t type;
+  err = js_typeof(env, value, &type);
+  if (err != 0) return err;
+
+  if (type == js_null) {
+    param->type = SQLITE3_NATIVE_VALUE_NULL;
+    return 0;
+  }
+
+  if (type == js_number) {
+    double number;
+    err = js_get_value_double(env, value, &number);
+    if (err != 0) return err;
+
+    if (!isfinite(number)) {
+      *error = sqlite3_native__format_string("SQLite parameter %u must be a finite number", index);
+      return -1;
+    }
+
+    if (
+      number >= sqlite3_native__min_safe_integer &&
+      number <= sqlite3_native__max_safe_integer &&
+      number == (double) ((int64_t) number)
+    ) {
+      param->type = SQLITE3_NATIVE_VALUE_INTEGER;
+      param->integer = (int64_t) number;
+    } else {
+      param->type = SQLITE3_NATIVE_VALUE_REAL;
+      param->real = number;
+    }
+
+    return 0;
+  }
+
+  if (type == js_string) {
+    size_t len;
+    err = js_get_value_string_utf8(env, value, NULL, 0, &len);
+    if (err != 0) return err;
+    if (len > INT_MAX) {
+      *error = sqlite3_native__format_string("SQLite parameter %u is too large", index);
+      return -1;
+    }
+
+    char *copy = malloc(len + 1);
+    if (copy == NULL) {
+      *error = sqlite3_native__copy_string("Out of memory", strlen("Out of memory"));
+      return -1;
+    }
+
+    err = js_get_value_string_utf8(env, value, (utf8_t *) copy, len + 1, NULL);
+    if (err != 0) {
+      free(copy);
+      return err;
+    }
+
+    param->type = SQLITE3_NATIVE_VALUE_TEXT;
+    param->bytes = copy;
+    param->len = (int) len;
+
+    return 0;
+  }
+
+  if (type == js_object) {
+    bool is_typedarray;
+    err = js_is_typedarray(env, value, &is_typedarray);
+    if (err != 0) return err;
+
+    if (is_typedarray) {
+      js_typedarray_type_t typedarray_type;
+      void *data;
+      size_t len;
+
+      err = js_get_typedarray_info(env, value, &typedarray_type, &data, &len, NULL, NULL);
+      if (err != 0) return err;
+
+      if (typedarray_type != js_uint8array) {
+        *error = sqlite3_native__format_string("SQLite parameter %u must be a Uint8Array", index);
+        return -1;
+      }
+
+      if (len > INT_MAX) {
+        *error = sqlite3_native__format_string("SQLite parameter %u is too large", index);
+        return -1;
+      }
+
+      void *copy = sqlite3_native__copy_bytes(data, (int) len);
+      if (copy == NULL && len > 0) {
+        *error = sqlite3_native__copy_string("Out of memory", strlen("Out of memory"));
+        return -1;
+      }
+
+      param->type = SQLITE3_NATIVE_VALUE_BLOB;
+      param->bytes = copy;
+      param->len = (int) len;
+
+      return 0;
+    }
+  }
+
+  *error = sqlite3_native__format_string("Unsupported SQLite parameter at index %u", index);
+  return -1;
+}
+
+static int
+sqlite3_native__parse_query_mode(js_env_t *env, js_value_t *value, sqlite3_native_query_mode_t *mode, char **error) {
+  int err;
+
+  js_value_type_t type;
+  err = js_typeof(env, value, &type);
+  if (err != 0) return err;
+
+  if (type != js_string) {
+    *error = sqlite3_native__copy_string("SQLite query mode must be a string", strlen("SQLite query mode must be a string"));
+    return -1;
+  }
+
+  char string[8];
+  size_t len;
+  err = js_get_value_string_utf8(env, value, (utf8_t *) string, sizeof(string), &len);
+  if (err != 0) return err;
+
+  if (len == 3 && strcmp(string, "run") == 0) {
+    *mode = SQLITE3_NATIVE_QUERY_RUN;
+    return 0;
+  }
+  if (len == 3 && strcmp(string, "all") == 0) {
+    *mode = SQLITE3_NATIVE_QUERY_ALL;
+    return 0;
+  }
+  if (len == 6 && strcmp(string, "values") == 0) {
+    *mode = SQLITE3_NATIVE_QUERY_VALUES;
+    return 0;
+  }
+  if (len == 3 && strcmp(string, "get") == 0) {
+    *mode = SQLITE3_NATIVE_QUERY_GET;
+    return 0;
+  }
+
+  *error = sqlite3_native__copy_string("SQLite query mode must be run, all, values, or get", strlen("SQLite query mode must be run, all, values, or get"));
+  return -1;
+}
+
+static int
+sqlite3_native__bind_query_param(sqlite3_stmt *stmt, int index, sqlite3_native_query_param_t *param) {
+  switch (param->type) {
+  case SQLITE3_NATIVE_VALUE_NULL:
+    return sqlite3_bind_null(stmt, index);
+  case SQLITE3_NATIVE_VALUE_INTEGER:
+    return sqlite3_bind_int64(stmt, index, param->integer);
+  case SQLITE3_NATIVE_VALUE_REAL:
+    return sqlite3_bind_double(stmt, index, param->real);
+  case SQLITE3_NATIVE_VALUE_TEXT:
+    return sqlite3_bind_text(stmt, index, (const char *) param->bytes, param->len, SQLITE_TRANSIENT);
+  case SQLITE3_NATIVE_VALUE_BLOB:
+    return sqlite3_bind_blob(stmt, index, param->bytes, param->len, SQLITE_TRANSIENT);
+  }
+
+  return SQLITE_MISUSE;
+}
+
+static int
+sqlite3_native__copy_column_names(sqlite3_native_query_t *req, sqlite3_stmt *stmt) {
+  if (req->column_count == 0) return SQLITE_OK;
+
+  req->column_names = calloc((size_t) req->column_count, sizeof(char *));
+  if (req->column_names == NULL) return SQLITE_NOMEM;
+
+  for (int i = 0; i < req->column_count; i++) {
+    const char *name = sqlite3_column_name(stmt, i);
+    if (name == NULL) name = "";
+
+    req->column_names[i] = sqlite3_native__copy_string(name, strlen(name));
+    if (req->column_names[i] == NULL) return SQLITE_NOMEM;
+  }
+
+  return SQLITE_OK;
+}
+
+static int
+sqlite3_native__copy_column_value(sqlite3_stmt *stmt, int column, sqlite3_native_query_value_t *value) {
+  memset(value, 0, sizeof(sqlite3_native_query_value_t));
+
+  int type = sqlite3_column_type(stmt, column);
+
+  switch (type) {
+  case SQLITE_NULL:
+    value->type = SQLITE3_NATIVE_VALUE_NULL;
+    return SQLITE_OK;
+  case SQLITE_INTEGER:
+    value->type = SQLITE3_NATIVE_VALUE_INTEGER;
+    value->integer = sqlite3_column_int64(stmt, column);
+    return SQLITE_OK;
+  case SQLITE_FLOAT:
+    value->type = SQLITE3_NATIVE_VALUE_REAL;
+    value->real = sqlite3_column_double(stmt, column);
+    return SQLITE_OK;
+  case SQLITE_TEXT: {
+    int len = sqlite3_column_bytes(stmt, column);
+    const unsigned char *text = sqlite3_column_text(stmt, column);
+    if (text == NULL && len > 0) return SQLITE_NOMEM;
+
+    char *copy = sqlite3_native__copy_string(text == NULL ? "" : (const char *) text, (size_t) len);
+    if (copy == NULL) return SQLITE_NOMEM;
+
+    value->type = SQLITE3_NATIVE_VALUE_TEXT;
+    value->bytes = copy;
+    value->len = len;
+    return SQLITE_OK;
+  }
+  case SQLITE_BLOB: {
+    int len = sqlite3_column_bytes(stmt, column);
+    const void *blob = sqlite3_column_blob(stmt, column);
+    if (blob == NULL && len > 0) return SQLITE_NOMEM;
+
+    void *copy = sqlite3_native__copy_bytes(blob, len);
+    if (copy == NULL && len > 0) return SQLITE_NOMEM;
+
+    value->type = SQLITE3_NATIVE_VALUE_BLOB;
+    value->bytes = copy;
+    value->len = len;
+    return SQLITE_OK;
+  }
+  }
+
+  return SQLITE_MISUSE;
+}
+
+static int
+sqlite3_native__append_query_row(sqlite3_native_query_t *req, sqlite3_stmt *stmt) {
+  if (req->row_count == req->row_capacity) {
+    int capacity = req->row_capacity == 0 ? 8 : req->row_capacity * 2;
+
+    sqlite3_native_query_row_t *rows = realloc(req->rows, (size_t) capacity * sizeof(sqlite3_native_query_row_t));
+    if (rows == NULL) return SQLITE_NOMEM;
+
+    memset(rows + req->row_capacity, 0, (size_t) (capacity - req->row_capacity) * sizeof(sqlite3_native_query_row_t));
+
+    req->rows = rows;
+    req->row_capacity = capacity;
+  }
+
+  sqlite3_native_query_row_t *row = &req->rows[req->row_count];
+  row->values = calloc((size_t) req->column_count, sizeof(sqlite3_native_query_value_t));
+  if (row->values == NULL && req->column_count > 0) return SQLITE_NOMEM;
+
+  for (int i = 0; i < req->column_count; i++) {
+    int err = sqlite3_native__copy_column_value(stmt, i, &row->values[i]);
+    if (err != SQLITE_OK) {
+      for (int j = 0; j < i; j++) sqlite3_native__free_query_value(&row->values[j]);
+      free(row->values);
+      row->values = NULL;
+      return err;
+    }
+  }
+
+  req->row_count++;
+
+  return SQLITE_OK;
+}
+
+static void
+sqlite3_native__on_before_query(uv_work_t *handle) {
+  sqlite3_native_query_t *req = (sqlite3_native_query_t *) handle->data;
+
+  if (req->error != NULL) return;
+
+  sqlite3_stmt *stmt = NULL;
+  int err = sqlite3_prepare_v2(req->db->handle, (const char *) req->query, -1, &stmt, NULL);
+  if (err != SQLITE_OK) {
+    sqlite3_native__set_query_sqlite_error(req);
+    return;
+  }
+
+  if (stmt == NULL) {
+    sqlite3_native__set_query_error(req, "SQLite query did not contain a statement");
+    return;
+  }
+
+  int bind_count = sqlite3_bind_parameter_count(stmt);
+  if (bind_count != req->params_len) {
+    sqlite3_native__set_query_errorf(req, "SQLite bind count mismatch: expected %d parameter(s), received %d", bind_count, req->params_len);
+    goto done;
+  }
+
+  for (int i = 0; i < req->params_len; i++) {
+    err = sqlite3_native__bind_query_param(stmt, i + 1, &req->params[i]);
+    if (err != SQLITE_OK) {
+      sqlite3_native__set_query_sqlite_error(req);
+      goto done;
+    }
+  }
+
+  if (req->mode == SQLITE3_NATIVE_QUERY_RUN) {
+    do {
+      err = sqlite3_step(stmt);
+    } while (err == SQLITE_ROW);
+
+    if (err != SQLITE_DONE) {
+      sqlite3_native__set_query_sqlite_error(req);
+      goto done;
+    }
+
+    req->changes = sqlite3_changes(req->db->handle);
+    req->last_insert_rowid = sqlite3_last_insert_rowid(req->db->handle);
+    goto done;
+  }
+
+  req->column_count = sqlite3_column_count(stmt);
+  err = sqlite3_native__copy_column_names(req, stmt);
+  if (err != SQLITE_OK) {
+    sqlite3_native__set_query_error(req, "Out of memory");
+    goto done;
+  }
+
+  while ((err = sqlite3_step(stmt)) == SQLITE_ROW) {
+    err = sqlite3_native__append_query_row(req, stmt);
+    if (err != SQLITE_OK) {
+      sqlite3_native__set_query_error(req, "Out of memory");
+      goto done;
+    }
+
+    if (req->mode == SQLITE3_NATIVE_QUERY_GET) goto done;
+  }
+
+  if (err != SQLITE_DONE) sqlite3_native__set_query_sqlite_error(req);
+
+done:
+  err = sqlite3_finalize(stmt);
+  if (err != SQLITE_OK && req->error == NULL) sqlite3_native__set_query_sqlite_error(req);
+}
+
+static int
+sqlite3_native__create_query_value(js_env_t *env, sqlite3_native_query_value_t *value, js_value_t **result) {
+  int err;
+
+  switch (value->type) {
+  case SQLITE3_NATIVE_VALUE_NULL:
+    return js_get_null(env, result);
+  case SQLITE3_NATIVE_VALUE_INTEGER:
+    return js_create_int64(env, value->integer, result);
+  case SQLITE3_NATIVE_VALUE_REAL:
+    return js_create_double(env, value->real, result);
+  case SQLITE3_NATIVE_VALUE_TEXT:
+    return js_create_string_utf8(env, (const utf8_t *) value->bytes, value->len, result);
+  case SQLITE3_NATIVE_VALUE_BLOB: {
+    js_value_t *arraybuffer;
+    void *data;
+    err = js_create_arraybuffer(env, (size_t) value->len, &data, &arraybuffer);
+    if (err != 0) return err;
+
+    if (value->len > 0) memcpy(data, value->bytes, (size_t) value->len);
+
+    return js_create_typedarray(env, js_uint8array, (size_t) value->len, arraybuffer, 0, result);
+  }
+  }
+
+  js_throw_error(env, NULL, "Unknown SQLite value type");
+  return js_pending_exception;
+}
+
+static int
+sqlite3_native__create_query_array_row(js_env_t *env, sqlite3_native_query_t *req, sqlite3_native_query_row_t *row, js_value_t **result) {
+  int err;
+
+  err = js_create_array_with_length(env, req->column_count, result);
+  if (err != 0) return err;
+
+  for (int i = 0; i < req->column_count; i++) {
+    js_value_t *value;
+    err = sqlite3_native__create_query_value(env, &row->values[i], &value);
+    if (err != 0) return err;
+
+    err = js_set_element(env, *result, i, value);
+    if (err != 0) return err;
+  }
+
+  return 0;
+}
+
+static int
+sqlite3_native__create_query_object_row(js_env_t *env, sqlite3_native_query_t *req, sqlite3_native_query_row_t *row, js_value_t **result) {
+  int err;
+
+  err = js_create_object(env, result);
+  if (err != 0) return err;
+
+  for (int i = 0; i < req->column_count; i++) {
+    js_value_t *value;
+    err = sqlite3_native__create_query_value(env, &row->values[i], &value);
+    if (err != 0) return err;
+
+    err = js_set_named_property(env, *result, req->column_names[i], value);
+    if (err != 0) return err;
+  }
+
+  return 0;
+}
+
+static int
+sqlite3_native__create_query_result(js_env_t *env, sqlite3_native_query_t *req, js_value_t **result) {
+  int err;
+
+  if (req->mode == SQLITE3_NATIVE_QUERY_RUN) {
+    js_value_t *changes;
+    js_value_t *last_insert_rowid;
+
+    err = js_create_object(env, result);
+    if (err != 0) return err;
+
+    err = js_create_int64(env, req->changes, &changes);
+    if (err != 0) return err;
+
+    err = js_set_named_property(env, *result, "changes", changes);
+    if (err != 0) return err;
+
+    err = js_create_int64(env, req->last_insert_rowid, &last_insert_rowid);
+    if (err != 0) return err;
+
+    return js_set_named_property(env, *result, "lastInsertRowid", last_insert_rowid);
+  }
+
+  if (req->mode == SQLITE3_NATIVE_QUERY_GET) {
+    if (req->row_count == 0) return js_get_null(env, result);
+
+    return sqlite3_native__create_query_object_row(env, req, &req->rows[0], result);
+  }
+
+  err = js_create_array_with_length(env, req->row_count, result);
+  if (err != 0) return err;
+
+  for (int i = 0; i < req->row_count; i++) {
+    js_value_t *row;
+    if (req->mode == SQLITE3_NATIVE_QUERY_VALUES) {
+      err = sqlite3_native__create_query_array_row(env, req, &req->rows[i], &row);
+    } else {
+      err = sqlite3_native__create_query_object_row(env, req, &req->rows[i], &row);
+    }
+    if (err != 0) return err;
+
+    err = js_set_element(env, *result, i, row);
+    if (err != 0) return err;
+  }
+
+  return 0;
+}
+
+static void
+sqlite3_native__on_after_query(uv_work_t *handle, int status) {
+  int err;
+
+  sqlite3_native_query_t *req = (sqlite3_native_query_t *) handle->data;
+
+  sqlite3_native_t *db = req->db;
+
+  js_env_t *env = db->env;
+
+  js_handle_scope_t *scope;
+  err = js_open_handle_scope(env, &scope);
+  assert(err == 0);
+
+  js_value_t *result;
+
+  if (req->error) {
+    js_value_t *message;
+    err = js_create_string_utf8(env, (utf8_t *) req->error, -1, &message);
+    assert(err == 0);
+
+    err = js_create_error(env, NULL, message, &result);
+    assert(err == 0);
+
+    err = js_reject_deferred(env, req->deferred, result);
+    assert(err == 0);
+  } else {
+    err = sqlite3_native__create_query_result(env, req, &result);
+    assert(err == 0);
+
+    err = js_resolve_deferred(env, req->deferred, result);
+    assert(err == 0);
+  }
+
+  err = js_close_handle_scope(env, scope);
+  assert(err == 0);
+
+  sqlite3_native__free_query(req);
+}
+
+static js_value_t *
+sqlite3_native__queue_query_error(js_env_t *env, uv_loop_t *loop, sqlite3_native_t *db, const char *message) {
+  int err;
+
+  sqlite3_native_query_t *req = calloc(1, sizeof(sqlite3_native_query_t));
+  if (req == NULL) return sqlite3_native__rejected_error(env, "Out of memory");
+
+  req->db = db;
+  req->error = sqlite3_native__copy_string(message, strlen(message));
+  if (req->error == NULL) {
+    free(req);
+    return sqlite3_native__rejected_error(env, "Out of memory");
+  }
+
+  req->handle.data = (void *) req;
+
+  js_value_t *promise;
+  err = js_create_promise(env, &req->deferred, &promise);
+  assert(err == 0);
+
+  err = uv_queue_work(loop, &req->handle, sqlite3_native__on_before_query, sqlite3_native__on_after_query);
+  assert(err == 0);
+
+  return promise;
+}
+
+static js_value_t *
+sqlite3_native_query(js_env_t *env, js_callback_info_t *info) {
+  int err;
+
+  size_t argc = 4;
+  js_value_t *argv[4];
+
+  err = js_get_callback_info(env, info, &argc, argv, NULL, NULL);
+  assert(err == 0);
+
+  assert(argc == 4);
+
+  uv_loop_t *loop;
+  err = js_get_env_loop(env, &loop);
+  assert(err == 0);
+
+  sqlite3_native_t *db;
+  err = js_get_arraybuffer_info(env, argv[0], (void **) &db, NULL);
+  assert(err == 0);
+
+  char *validation_error = NULL;
+
+  js_value_type_t query_type;
+  err = js_typeof(env, argv[1], &query_type);
+  if (err != 0) return NULL;
+  if (query_type != js_string) {
+    return sqlite3_native__queue_query_error(env, loop, db, "SQLite query SQL must be a string");
+  }
+
+  bool params_is_array;
+  err = js_is_array(env, argv[2], &params_is_array);
+  if (err != 0) return NULL;
+  if (!params_is_array) {
+    return sqlite3_native__queue_query_error(env, loop, db, "SQLite query params must be an array");
+  }
+
+  sqlite3_native_query_mode_t mode;
+  err = sqlite3_native__parse_query_mode(env, argv[3], &mode, &validation_error);
+  if (err != 0) {
+    js_value_t *promise = sqlite3_native__queue_query_error(env, loop, db, validation_error == NULL ? "Invalid SQLite query mode" : validation_error);
+    free(validation_error);
+    return promise;
+  }
+
+  size_t query_len;
+  err = js_get_value_string_utf8(env, argv[1], NULL, 0, &query_len);
+  if (err != 0) return NULL;
+
+  utf8_t *query = malloc(query_len + 1);
+  if (query == NULL) {
+    return sqlite3_native__queue_query_error(env, loop, db, "Out of memory");
+  }
+
+  err = js_get_value_string_utf8(env, argv[1], query, query_len + 1, NULL);
+  if (err != 0) {
+    free(query);
+    return NULL;
+  }
+
+  uint32_t params_len;
+  err = js_get_array_length(env, argv[2], &params_len);
+  if (err != 0) {
+    free(query);
+    return NULL;
+  }
+  if (params_len > INT_MAX) {
+    free(query);
+    return sqlite3_native__queue_query_error(env, loop, db, "SQLite query params array is too large");
+  }
+
+  sqlite3_native_query_param_t *params = NULL;
+  if (params_len > 0) {
+    params = calloc(params_len, sizeof(sqlite3_native_query_param_t));
+    if (params == NULL) {
+      free(query);
+      return sqlite3_native__queue_query_error(env, loop, db, "Out of memory");
+    }
+  }
+
+  for (uint32_t i = 0; i < params_len; i++) {
+    js_value_t *value;
+    err = js_get_element(env, argv[2], i, &value);
+    if (err != 0) {
+      free(query);
+      for (uint32_t j = 0; j < i; j++) sqlite3_native__free_query_param(&params[j]);
+      free(params);
+      return NULL;
+    }
+
+    err = sqlite3_native__copy_js_param(env, value, &params[i], i, &validation_error);
+    if (err != 0) {
+      js_value_t *promise = sqlite3_native__queue_query_error(env, loop, db, validation_error == NULL ? "Invalid SQLite parameter" : validation_error);
+      free(query);
+      for (uint32_t j = 0; j <= i; j++) sqlite3_native__free_query_param(&params[j]);
+      free(params);
+      free(validation_error);
+      return promise;
+    }
+  }
+
+  sqlite3_native_query_t *req = calloc(1, sizeof(sqlite3_native_query_t));
+  if (req == NULL) {
+    free(query);
+    for (uint32_t i = 0; i < params_len; i++) sqlite3_native__free_query_param(&params[i]);
+    free(params);
+    return sqlite3_native__queue_query_error(env, loop, db, "Out of memory");
+  }
+
+  req->db = db;
+  req->query = query;
+  req->params = params;
+  req->params_len = (int) params_len;
+  req->mode = mode;
+
+  req->handle.data = (void *) req;
+
+  js_value_t *promise;
+  err = js_create_promise(env, &req->deferred, &promise);
+  assert(err == 0);
+
+  err = uv_queue_work(loop, &req->handle, sqlite3_native__on_before_query, sqlite3_native__on_after_query);
+  assert(err == 0);
+
+  return promise;
+}
+
 static void
 sqlite3_native__on_after_load_extension(uv_work_t *handle, int status) {
   int err;
@@ -1403,6 +2275,7 @@ sqlite3_native_exports(js_env_t *env, js_value_t *exports) {
   V("close", sqlite3_native_close)
   V("exec", sqlite3_native_exec)
   V("loadExtension", sqlite3_native_load_extension)
+  V("query", sqlite3_native_query)
 #undef V
 
   return exports;
