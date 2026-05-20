@@ -254,6 +254,21 @@ test('query supports unique index lookup and many rows', async (t) => {
   t.alike(count, { count: 250 })
 })
 
+test('query returns rows for SQLite PRAGMA statements', async (t) => {
+  const sql = create(t)
+
+  await sql.query('CREATE TABLE records (id INTEGER PRIMARY KEY, name TEXT)', [], 'run')
+
+  const columns = await sql.query("PRAGMA table_info('records')", [], 'values')
+  t.alike(
+    columns.map((row) => row[1]),
+    ['id', 'name']
+  )
+
+  const options = await sql.query('PRAGMA compile_options', [], 'values')
+  t.ok(options.length > 0)
+})
+
 test('query close waits for pending work and rejects later work', async (t) => {
   const sql = create(t)
 

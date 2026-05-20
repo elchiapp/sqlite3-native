@@ -556,7 +556,7 @@ sqlite3_native__on_vfs_check_reserved_lock(sqlite3_file *sql_file, int *pResOut)
 
 static int
 sqlite3_native__on_vfs_control(sqlite3_file *sql_file, int op, void *pArg) {
-  return SQLITE_OK;
+  return SQLITE_NOTFOUND;
 }
 
 static int
