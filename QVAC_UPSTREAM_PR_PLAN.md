@@ -15,7 +15,22 @@ into small, reviewable branches.
 
 ## Suggested PR Sequence
 
-### PR 1: Prepared Statement Run Mode
+### PR 1: VFS File-Control Fallthrough
+
+Scope:
+
+- Return `SQLITE_NOTFOUND` from the default VFS `xFileControl` handler for
+  unhandled operations.
+- Preserve existing VFS behavior except allowing SQLite PRAGMAs and other
+  file-control callers to continue through SQLite's fallback path.
+
+Tests:
+
+- `PRAGMA table_info(...)` returns rows through the public query path once that
+  query API exists, or through the smallest available prepared-statement test
+  harness for this PR.
+
+### PR 2: Prepared Statement Run Mode
 
 Scope:
 
@@ -37,7 +52,7 @@ Tests:
 - too few and too many params reject
 - statement works after an error
 
-### PR 2: Typed Scalar Result Values
+### PR 3: Typed Scalar Result Values
 
 Scope:
 
@@ -52,7 +67,7 @@ Tests:
 - integer and float return numbers
 - text returns string
 
-### PR 3: Object Rows And Single Row Mode
+### PR 4: Object Rows And Single Row Mode
 
 Scope:
 
@@ -67,7 +82,7 @@ Tests:
 - `get` returns null when no rows match
 - unique index lookup
 
-### PR 4: Uint8Array/BLOB Support
+### PR 5: Uint8Array/BLOB Support
 
 Scope:
 
@@ -81,7 +96,7 @@ Tests:
 - large blob byte-for-byte round trip
 - repeated blob insert/select loop
 
-### PR 5: Async Close And Error Hardening
+### PR 6: Async Close And Error Hardening
 
 Scope:
 
@@ -97,7 +112,7 @@ Tests:
 - unsupported param type rejects without crashing Bare
 - subsequent query after validation error still works
 
-### PR 6: CI Matrix Verification
+### PR 7: CI Matrix Verification
 
 Scope:
 
