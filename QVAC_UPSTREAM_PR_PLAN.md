@@ -119,6 +119,10 @@ Scope:
 - Keep lint, `test:bare`, and `test:node` in CI.
 - Preserve existing prebuild targets.
 - Add only minimal CI edits required by the query API series.
+- Ensure iOS device and simulator prebuilds use an explicit deployment target
+  low enough for supported devices. QVAC physical-device smoke found that an
+  addon built with SDK 26.5 as the minimum OS would not load on an iOS 26.4.2
+  device; local validation used a rebuilt iOS arm64 prebuild with min iOS 15.1.
 
 Targets to preserve:
 
